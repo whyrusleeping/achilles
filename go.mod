@@ -5,7 +5,7 @@ go 1.23
 toolchain go1.23.4
 
 require (
-	github.com/bluesky-social/indigo v0.0.0-20250225075145-464ab8d6b5a0
+	github.com/bluesky-social/indigo v0.0.0-20250301025210-a4e0cc37e188
 	github.com/gorilla/websocket v1.5.1
 	github.com/labstack/echo/v4 v4.11.3
 	github.com/urfave/cli/v2 v2.25.7

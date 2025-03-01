@@ -20,6 +20,7 @@ import (
 	"github.com/bluesky-social/indigo/api/atproto"
 	"github.com/bluesky-social/indigo/api/bsky"
 	"github.com/bluesky-social/indigo/atproto/crypto"
+	label "github.com/bluesky-social/indigo/atproto/label"
 	"github.com/bluesky-social/indigo/atproto/syntax"
 	"github.com/bluesky-social/indigo/events"
 	"github.com/bluesky-social/indigo/lex/util"
@@ -299,10 +300,60 @@ type Server struct {
 	Echo *echo.Echo
 	Sk   crypto.PrivateKeyExportable
 
+	LabelerDid string
+
 	Events *events.EventManager
 }
 
+func (s *Server) AddAccountLabel(ctx context.Context, did string, lval string) error {
+	l := label.Label{
+		CreatedAt: time.Now().Format(time.RFC3339),
+		SourceDID: s.LabelerDid,
+		URI:       did,
+		Val:       lval,
+		Version:   1,
+	}
+
+	if err := l.Sign(s.Sk); err != nil {
+		return err
+	}
+
+	ll := l.ToLexicon()
+	return s.Events.AddEvent(ctx, &events.XRPCStreamEvent{
+		LabelLabels: &atproto.LabelSubscribeLabels_Labels{
+			Labels: []*atproto.LabelDefs_Label{&ll},
+		},
+	})
+}
+
+func (s *Server) AddPostLabel(ctx context.Context, uri string, lval string) error {
+	l := label.Label{
+		CreatedAt: time.Now().Format(time.RFC3339),
+		SourceDID: s.LabelerDid,
+		URI:       uri,
+		Val:       lval,
+		Version:   1,
+	}
+
+	if err := l.Sign(s.Sk); err != nil {
+		return err
+	}
+
+	ll := l.ToLexicon()
+	return s.Events.AddEvent(ctx, &events.XRPCStreamEvent{
+		LabelLabels: &atproto.LabelSubscribeLabels_Labels{
+			Labels: []*atproto.LabelDefs_Label{&ll},
+		},
+	})
+}
+
 func (s *Server) handleQueryLabels(c echo.Context) error {
+	return c.JSON(http.StatusOK, map[string]string{
+		"status": "not implemented yet",
+	})
+}
+
+func (s *Server) handleCreateReport(c echo.Context) error {
 	return c.JSON(http.StatusOK, map[string]string{
 		"status": "not implemented yet",
 	})
@@ -437,6 +488,7 @@ func runServer(cctx *cli.Context) error {
 	certDir := cctx.String("cert-dir")
 	dbPath := cctx.String("db-path")
 	privKey := cctx.String("private-key")
+	labelerDid := cctx.String("labeler-did")
 
 	pkb, err := os.ReadFile(privKey)
 	if err != nil {
@@ -463,10 +515,11 @@ func runServer(cctx *cli.Context) error {
 	e := echo.New()
 
 	srv := &Server{
-		DB:     db,
-		Echo:   e,
-		Sk:     privk,
-		Events: em,
+		DB:         db,
+		Echo:       e,
+		Sk:         privk,
+		Events:     em,
+		LabelerDid: labelerDid,
 	}
 
 	// Middleware
@@ -479,6 +532,7 @@ func runServer(cctx *cli.Context) error {
 	})
 	e.GET("/xrpc/com.atproto.label.queryLabels", srv.handleQueryLabels)
 	e.GET("/xrpc/com.atproto.label.subscribeLabels", srv.handleSubscribeLabels)
+	e.POST("/xrpc/com.atproto.moderation.createReport", srv.handleCreateReport)
 
 	// Ensure certificate cache directory exists
 	if tlsEnabled && domain != "" {
