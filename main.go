@@ -64,6 +64,10 @@ func main() {
 				Value: "./achilles.db",
 				Usage: "Path to SQLite database file",
 			},
+			&cli.StringFlag{
+				Name:  "private-key",
+				Value: "priv.key",
+			},
 		},
 		Commands: []*cli.Command{
 			setupAccountCmd,
