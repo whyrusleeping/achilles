@@ -478,7 +478,7 @@ func runServer(cctx *cli.Context) error {
 		return c.String(http.StatusOK, "Hello, Achilles!")
 	})
 	e.GET("/xrpc/com.atproto.label.queryLabels", srv.handleQueryLabels)
-	e.GET("/xrpc/com.atproto.label.subscribeLabels", srv.handleQueryLabels)
+	e.GET("/xrpc/com.atproto.label.subscribeLabels", srv.handleSubscribeLabels)
 
 	// Ensure certificate cache directory exists
 	if tlsEnabled && domain != "" {
