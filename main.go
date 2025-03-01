@@ -7,9 +7,13 @@ import (
 	"fmt"
 	"io"
 	"log"
+	"log/slog"
+	"net"
 	"net/http"
 	"os"
+	"strconv"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/bluesky-social/indigo/api/agnostic"
@@ -17,8 +21,10 @@ import (
 	"github.com/bluesky-social/indigo/api/bsky"
 	"github.com/bluesky-social/indigo/atproto/crypto"
 	"github.com/bluesky-social/indigo/atproto/syntax"
+	"github.com/bluesky-social/indigo/events"
 	"github.com/bluesky-social/indigo/lex/util"
 	"github.com/bluesky-social/indigo/util/cliutil"
+	"github.com/gorilla/websocket"
 	"github.com/labstack/echo/v4"
 	"github.com/labstack/echo/v4/middleware"
 	"github.com/urfave/cli/v2"
@@ -257,6 +263,15 @@ var setupAccountCmd = &cli.Command{
 		rec.CreatedAt = time.Now().Format(time.RFC3339)
 
 		rkey := "self"
+		_, err = atproto.RepoDeleteRecord(ctx, client, &atproto.RepoDeleteRecord_Input{
+			Collection: "app.bsky.labeler.service",
+			Repo:       client.Auth.Did,
+			Rkey:       rkey,
+		})
+		if err != nil {
+			fmt.Println("deleting old record: ", err)
+		}
+
 		resp, err := atproto.RepoCreateRecord(ctx, client, &atproto.RepoCreateRecord_Input{
 			Collection: "app.bsky.labeler.service",
 			Record: &util.LexiconTypeDecoder{
@@ -278,6 +293,9 @@ var setupAccountCmd = &cli.Command{
 type Server struct {
 	DB   *gorm.DB
 	Echo *echo.Echo
+	Sk   crypto.PrivateKeyExportable
+
+	Events *events.EventManager
 }
 
 func (s *Server) handleQueryLabels(c echo.Context) error {
@@ -286,23 +304,165 @@ func (s *Server) handleQueryLabels(c echo.Context) error {
 	})
 }
 
+var (
+	upgrader = websocket.Upgrader{}
+)
+
+func (s *Server) handleSubscribeLabels(c echo.Context) error {
+	var since *int64
+	if sinceVal := c.QueryParam("cursor"); sinceVal != "" {
+		sval, err := strconv.ParseInt(sinceVal, 10, 64)
+		if err != nil {
+			return err
+		}
+		since = &sval
+	}
+
+	ctx, cancel := context.WithCancel(c.Request().Context())
+	defer cancel()
+
+	// TODO: authhhh
+	conn, err := websocket.Upgrade(c.Response(), c.Request(), c.Response().Header(), 10<<10, 10<<10)
+	if err != nil {
+		return fmt.Errorf("upgrading websocket: %w", err)
+	}
+
+	defer conn.Close()
+
+	lastWriteLk := sync.Mutex{}
+	lastWrite := time.Now()
+
+	// Start a goroutine to ping the client every 30 seconds to check if it's
+	// still alive. If the client doesn't respond to a ping within 5 seconds,
+	// we'll close the connection and teardown the consumer.
+	go func() {
+		ticker := time.NewTicker(30 * time.Second)
+		defer ticker.Stop()
+
+		for {
+			select {
+			case <-ticker.C:
+				lastWriteLk.Lock()
+				lw := lastWrite
+				lastWriteLk.Unlock()
+
+				if time.Since(lw) < 30*time.Second {
+					continue
+				}
+
+				if err := conn.WriteControl(websocket.PingMessage, []byte{}, time.Now().Add(5*time.Second)); err != nil {
+					slog.Warn("failed to ping client", "err", err)
+					cancel()
+					return
+				}
+			case <-ctx.Done():
+				return
+			}
+		}
+	}()
+
+	conn.SetPingHandler(func(message string) error {
+		err := conn.WriteControl(websocket.PongMessage, []byte(message), time.Now().Add(time.Second*60))
+		if err == websocket.ErrCloseSent {
+			return nil
+		} else if e, ok := err.(net.Error); ok && e.Temporary() {
+			return nil
+		}
+		return err
+	})
+
+	// Start a goroutine to read messages from the client and discard them.
+	go func() {
+		for {
+			_, _, err := conn.ReadMessage()
+			if err != nil {
+				slog.Warn("failed to read message from client", "err", err)
+				cancel()
+				return
+			}
+		}
+	}()
+
+	events, cleanup, err := s.Events.Subscribe(ctx, "", func(evt *events.XRPCStreamEvent) bool { return true }, since)
+	if err != nil {
+		return err
+	}
+	defer cleanup()
+
+	for {
+		select {
+		case evt, ok := <-events:
+			if !ok {
+				slog.Error("event stream closed unexpectedly")
+				return nil
+			}
+
+			wc, err := conn.NextWriter(websocket.BinaryMessage)
+			if err != nil {
+				slog.Error("failed to get next writer", "err", err)
+				return err
+			}
+
+			if evt.Preserialized != nil {
+				_, err = wc.Write(evt.Preserialized)
+			} else {
+				err = evt.Serialize(wc)
+			}
+			if err != nil {
+				return fmt.Errorf("failed to write event: %w", err)
+			}
+
+			if err := wc.Close(); err != nil {
+				slog.Warn("failed to flush-close our event write", "err", err)
+				return nil
+			}
+
+			lastWriteLk.Lock()
+			lastWrite = time.Now()
+			lastWriteLk.Unlock()
+		case <-ctx.Done():
+			return nil
+		}
+	}
+}
+
 func runServer(cctx *cli.Context) error {
 	port := cctx.String("port")
 	domain := cctx.String("domain")
 	tlsEnabled := cctx.Bool("tls")
 	certDir := cctx.String("cert-dir")
 	dbPath := cctx.String("db-path")
+	privKey := cctx.String("private-key")
+
+	pkb, err := os.ReadFile(privKey)
+	if err != nil {
+		return err
+	}
+
+	privk, err := crypto.ParsePrivateMultibase(string(pkb))
+	if err != nil {
+		return err
+	}
 
 	db, err := gorm.Open(sqlite.Open(dbPath), &gorm.Config{})
 	if err != nil {
 		return fmt.Errorf("failed to connect to database: %w", err)
 	}
 
+	persist, err := events.NewDbPersistence(db, nil, nil)
+	if err != nil {
+		return err
+	}
+
+	em := events.NewEventManager(persist)
+
 	e := echo.New()
 
 	srv := &Server{
-		DB:   db,
-		Echo: e,
+		DB:     db,
+		Echo:   e,
+		Sk:     privk,
+		Events: em,
 	}
 
 	// Middleware
@@ -314,6 +474,7 @@ func runServer(cctx *cli.Context) error {
 		return c.String(http.StatusOK, "Hello, Achilles!")
 	})
 	e.GET("/xrpc/com.atproto.label.queryLabels", srv.handleQueryLabels)
+	e.GET("/xrpc/com.atproto.label.subscribeLabels", srv.handleQueryLabels)
 
 	// Ensure certificate cache directory exists
 	if tlsEnabled && domain != "" {
